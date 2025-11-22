@@ -1,17 +1,27 @@
 import logging
+import os
+import json
+import datetime
+from typing import Optional, List
 
 from dotenv import load_dotenv
+from livekit import rtc
 from livekit.agents import (
     Agent,
+    AgentServer,
     AgentSession,
     JobContext,
     JobProcess,
+    RunContext,
     MetricsCollectedEvent,
     RoomInputOptions,
     WorkerOptions,
+    inference,
     cli,
     metrics,
     tokenize,
+    room_io,
+    function_tool,
     # function_tool,
     # RunContext
 )
@@ -26,11 +36,160 @@ load_dotenv(".env.local")
 class Assistant(Agent):
     def __init__(self) -> None:
         super().__init__(
-            instructions="""You are a helpful voice AI assistant. The user is interacting with you via voice, even if you perceive the conversation as text.
-            You eagerly assist users with their questions by providing information from your extensive knowledge.
-            Your responses are concise, to the point, and without any complex formatting or punctuation including emojis, asterisks, or other symbols.
-            You are curious, friendly, and have a sense of humor.""",
+            instructions="""
+You are a friendly coffee shop barista for a brand called Falcon Brew.
+
+You take exactly ONE coffee order at a time and maintain this JSON order state:
+
+{
+  "drinkType": "string",
+  "size": "string",
+  "milk": "string",
+  "extras": ["string"],
+  "name": "string"
+}
+
+Your workflow:
+- Greet the customer.
+- Ask what they'd like to drink.
+- Ask clarifying questions until ALL fields in the order are filled.
+- You can accept combined phrases (e.g. "a large iced latte with oat milk") and then only ask for what is still missing.
+- Never guess any detail. If you are unsure, ASK.
+- As you learn anything about the order, call the `update_order` tool with the fields you understood.
+- When you believe the order is complete, FIRST:
+  - Read back a short summary to the customer in one or two sentences.
+  - THEN call the `save_order` tool to persist the order.
+- Use the `reset_order` tool if the customer wants to completely change their order.
+- Keep responses short and conversational, like a real barista talking at the counter.
+""",
         )
+
+    @function_tool()
+    async def update_order(
+        self,
+        context: RunContext,
+        drinkType: str = "",
+        size: str = "",
+        milk: str = "",
+        extras: Optional[List[str]] = None,
+        name: str = "",
+    ) -> str:
+        """
+        Update the current coffee order.
+
+        Call this whenever the customer provides ANY order details
+        (drinkType, size, milk, extras, or name).
+
+        You can call this multiple times as you collect more information.
+        Only send the fields that changed.
+        """
+        # initialize order state if missing
+        userdata = context.session.userdata
+        order = userdata.get("order")
+        if order is None:
+            order = {
+                "drinkType": "",
+                "size": "",
+                "milk": "",
+                "extras": [],
+                "name": "",
+            }
+            userdata["order"] = order
+
+        if drinkType:
+            order["drinkType"] = drinkType
+        if size:
+            order["size"] = size
+        if milk:
+            order["milk"] = milk
+        if extras is not None:
+            order["extras"] = extras
+        if name:
+            order["name"] = name
+
+        missing = [
+            key
+            for key in ("drinkType", "size", "milk", "name")
+            if not order.get(key)
+        ]
+
+        return json.dumps(
+            {
+                "order": order,
+                "missing_fields": missing,
+            }
+        )
+
+
+    @function_tool()
+    async def reset_order(self, context: RunContext) -> str:
+        """
+        Clear the current order and start over.
+
+        Use this if the customer wants to change their whole order.
+        """
+        context.session.userdata["order"] = {
+            "drinkType": "",
+            "size": "",
+            "milk": "",
+            "extras": [],
+            "name": "",
+        }
+        return "Order has been reset. Start a fresh order with the customer."
+
+    @function_tool()
+    async def save_order(self, context: RunContext) -> str:
+        """
+        Save the current completed order to a JSON file.
+
+        Only call this AFTER all fields are filled and you've
+        verbally confirmed the order with the customer.
+        """
+        order = context.session.userdata.get("order")
+
+        if not order:
+            return "There is no active order to save."
+
+        missing = [
+            key
+            for key in ("drinkType", "size", "milk", "name")
+            if not order.get(key)
+        ]
+
+        if missing:
+            return (
+                "Order is not complete yet. Missing fields: "
+                + ", ".join(missing)
+            )
+
+        # Make sure extras is at least an empty list
+        if order.get("extras") is None:
+            order["extras"] = []
+
+        # Ensure orders directory exists
+        os.makedirs("orders", exist_ok=True)
+
+        # Use UTC timestamp to avoid clashes
+        timestamp = datetime.datetime.utcnow().strftime("%Y%m%d-%H%M%S")
+        safe_name = (order.get("name") or "guest").replace(" ", "_")
+        filename = f"orders/order-{timestamp}-{safe_name}.json"
+
+        with open(filename, "w", encoding="utf-8") as f:
+            json.dump(order, f, indent=2)
+
+        context.session.userdata["last_saved_order_file"] = filename
+
+        # Short human-readable summary (this is what your frontend can show as text)
+        summary = (
+            f"Order for {order['name']}: "
+            f"{order['size']} {order['drinkType']} with {order['milk']} milk"
+        )
+        if order["extras"]:
+            summary += f", extras: {', '.join(order['extras'])}."
+
+        return summary
+
+
 
     # To add tools, use the @function_tool decorator.
     # Here's an example that adds a simple weather tool.
@@ -86,7 +245,9 @@ async def entrypoint(ctx: JobContext):
         # allow the LLM to generate a response while waiting for the end of turn
         # See more at https://docs.livekit.io/agents/build/audio/#preemptive-generation
         preemptive_generation=True,
+        
     )
+    session.userdata = {}
 
     # To use a realtime model instead of a voice pipeline, use the following session setup instead.
     # (Note: This is for the OpenAI Realtime API. For other providers, see https://docs.livekit.io/agents/models/realtime/))
