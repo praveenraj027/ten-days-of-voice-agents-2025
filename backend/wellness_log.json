@@ -1,0 +1,14 @@
+[
+  {
+    "timestamp": "2025-11-23T16:16:04.119560+00:00",
+    "mood": "a bit tired",
+    "energy": 4,
+    "stressors": "getting stuck on DSC questions",
+    "objectives": [
+      "listen to music",
+      "lie down with closed eyes",
+      "hang out with friends"
+    ],
+    "agent_summary": "Today you are feeling a bit tired, energy around 4/10, due to challenging DSC questions. Your goals are to listen to music, lie down with closed eyes, and spontaneously hang out with friends."
+  }
+]
