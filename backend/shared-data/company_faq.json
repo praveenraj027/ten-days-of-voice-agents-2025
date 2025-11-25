@@ -1,0 +1,41 @@
+{
+  "company": "Zoho CRM",
+  "description": "Zoho CRM is a cloud-based customer relationship management platform that helps businesses manage sales, marketing, and customer support from a single interface.",
+  "key_features": [
+    "Lead and contact management",
+    "Workflow automation",
+    "Sales forecasting and analytics",
+    "AI-powered insights via Zia",
+    "Omnichannel communication (email, phone, chat, social)",
+    "Custom dashboards and reports"
+  ],
+  "pricing": {
+    "free_plan": "Yes, a Free Edition is available for up to 3 users.",
+    "standard_plan": "₹800/user/month billed annually",
+    "professional_plan": "₹1,400/user/month billed annually",
+    "enterprise_plan": "₹2,400/user/month billed annually",
+    "ultimate_plan": "₹2,800/user/month billed annually"
+  },
+  "faq": [
+    {
+      "question": "What does Zoho CRM do?",
+      "answer": "Zoho CRM helps businesses streamline their sales, marketing, and customer service operations by keeping all customer data and interactions in one place."
+    },
+    {
+      "question": "Who is Zoho CRM for?",
+      "answer": "Zoho CRM is designed for businesses of all sizes—from startups to large enterprises—looking to manage customer relationships effectively."
+    },
+    {
+      "question": "Does Zoho CRM offer a free tier?",
+      "answer": "Yes. Zoho CRM offers a Free Edition that supports up to 3 users with essential CRM features."
+    },
+    {
+      "question": "Can Zoho CRM integrate with other tools?",
+      "answer": "Yes, Zoho CRM integrates with tools like Google Workspace, Microsoft 365, Slack, Mailchimp, and Zoho’s own suite of apps."
+    },
+    {
+      "question": "Is Zoho CRM suitable for small businesses?",
+      "answer": "Absolutely. Many small and mid-sized businesses use Zoho CRM for its affordability and ease of use."
+    }
+  ]
+}

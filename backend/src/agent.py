@@ -1,6 +1,8 @@
+# agent_sdr.py
 import logging
 import os
 import json
+import datetime
 from typing import Optional, List, Dict, Any, Literal
 
 from dotenv import load_dotenv
@@ -26,425 +28,314 @@ from livekit.plugins import murf, silero, google, deepgram, noise_cancellation
 from livekit.plugins.turn_detector.multilingual import MultilingualModel
 
 logger = logging.getLogger("agent")
-
 load_dotenv(".env.local")
 
-# ---------- Paths ---------- #
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DATA_DIR = os.path.join(os.path.dirname(BASE_DIR), "shared-data")
+FAQ_PATH = os.path.join(DATA_DIR, "company_faq.json")
+LEADS_DIR = os.path.join(BASE_DIR, "leads")
+os.makedirs(LEADS_DIR, exist_ok=True)
 
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-TUTOR_CONTENT_PATH = os.path.join(BASE_DIR, "shared-data", "day4_tutor_content.json")
+# -- Load company FAQ content (small in-memory RAG) -- #
+COMPANY_CONTENT: Dict[str, Any] = {}
+FAQ_LIST: List[Dict[str, str]] = []
 
-# ---------- Load tutor content from JSON ---------- #
+def _safe_company_field(field: str, default: str = "Unknown") -> str:
+    """
+    Safely return COMPANY_CONTENT['company'][field] if possible.
+    """
+    try:
+        if isinstance(COMPANY_CONTENT, dict):
+            company = COMPANY_CONTENT.get("company", {})
+            if isinstance(company, dict):
+                return company.get(field, default)
+    except Exception as e:
+        logger.warning("Error reading company content: %s", e)
+    return default
 
-TUTOR_CONCEPTS: List[Dict[str, str]] = []
-TUTOR_BY_ID: Dict[str, Dict[str, str]] = {}
-TUTOR_CONTENT_STR: str = ""
+def load_company_content():
+    """
+    Load and normalize shared-data/company_faq.json into the expected schema:
+    {
+      "company": {"name": "...", "short_description": "..."},
+      "faqs": [ {"id":..., "q":..., "a":...}, ... ],
+      "pricing_summary": [...]
+    }
+    """
+    global COMPANY_CONTENT, FAQ_LIST
+    if not os.path.exists(FAQ_PATH):
+        raise FileNotFoundError(f"company_faq.json not found at {FAQ_PATH}. Create one from the provided JSON.")
 
+    with open(FAQ_PATH, "r", encoding="utf-8") as f:
+        raw = json.load(f)
 
-def _load_tutor_content() -> None:
-    global TUTOR_CONCEPTS, TUTOR_BY_ID, TUTOR_CONTENT_STR
+    # Start with a safe empty shape
+    COMPANY_CONTENT = {"company": {"name": "Unknown", "short_description": ""}}
+    COMPANY_CONTENT["faqs"] = []
+    COMPANY_CONTENT["pricing_summary"] = []
 
-    if not os.path.exists(TUTOR_CONTENT_PATH):
-        raise FileNotFoundError(
-            f"Tutor content JSON not found at {TUTOR_CONTENT_PATH}. "
-            f"Create it with the concepts for Day 4."
-        )
-
-    with open(TUTOR_CONTENT_PATH, "r", encoding="utf-8") as f:
-        data = json.load(f)
-
-    if not isinstance(data, list):
-        raise ValueError("day4_tutor_content.json must be a list of concept objects.")
-
-    TUTOR_CONCEPTS = []
-    for item in data:
-        if not all(k in item for k in ("id", "title", "summary", "sample_question")):
-            raise ValueError("Each concept must have id, title, summary, sample_question.")
-        TUTOR_CONCEPTS.append(
-            {
-                "id": item["id"],
-                "title": item["title"],
-                "summary": item["summary"],
-                "sample_question": item["sample_question"],
-            }
-        )
-
-    TUTOR_BY_ID = {c["id"]: c for c in TUTOR_CONCEPTS}
-
-    lines = []
-    for c in TUTOR_CONCEPTS:
-        lines.append(
-            f"- id: {c['id']}\n"
-            f"  title: {c['title']}\n"
-            f"  summary: {c['summary']}\n"
-            f"  sample_question: {c['sample_question']}"
-        )
-    TUTOR_CONTENT_STR = "\n".join(lines)
-
-
-def _default_concept_id() -> str:
-    return TUTOR_CONCEPTS[0]["id"] if TUTOR_CONCEPTS else "variables"
-
-
-_load_tutor_content()
-
-
-# ---------- Tutor state helpers (stored in session.userdata["tutor"]) ---------- #
-
-def _ensure_tutor_state(session) -> Dict[str, Any]:
-    ud = session.userdata
-    tutor = ud.get("tutor")
-    if not isinstance(tutor, dict):
-        tutor = {}
-        ud["tutor"] = tutor
-
-    if "mode" not in tutor:
-        tutor["mode"] = "welcome"
-    if "concept_id" not in tutor:
-        tutor["concept_id"] = _default_concept_id()
-
-    return tutor
-
-
-def _set_tutor_mode(session, mode: str, concept_id: Optional[str] = None) -> Dict[str, Any]:
-    tutor = _ensure_tutor_state(session)
-    tutor["mode"] = mode
-    if concept_id is not None:
-        if concept_id in TUTOR_BY_ID:
-            tutor["concept_id"] = concept_id
+    if isinstance(raw, dict):
+        # If already in expected schema (company is dict)
+        if "company" in raw and isinstance(raw["company"], dict):
+            # Copy through but ensure keys exist
+            COMPANY_CONTENT.update(raw)
+            if "faqs" not in COMPANY_CONTENT:
+                COMPANY_CONTENT["faqs"] = []
+            if "pricing_summary" not in COMPANY_CONTENT:
+                COMPANY_CONTENT["pricing_summary"] = raw.get("pricing_summary", [])
         else:
-            tutor["concept_id"] = _default_concept_id()
-    return tutor
+            # Legacy flat schema: company as string + description, faq (list of dicts), pricing dict
+            company_name = raw.get("company") if isinstance(raw.get("company"), str) else raw.get("company", "Unknown")
+            company_desc = raw.get("description") or raw.get("short_description") or ""
+            COMPANY_CONTENT["company"]["name"] = company_name
+            COMPANY_CONTENT["company"]["short_description"] = company_desc
 
+            # FAQs: prefer 'faqs' but also accept 'faq'
+            faqs_raw = raw.get("faqs") or raw.get("faq") or raw.get("faq_list") or []
+            normalized_faqs = []
+            for i, item in enumerate(faqs_raw):
+                if isinstance(item, dict):
+                    q = item.get("q") or item.get("question") or item.get("question_text") or item.get("question") or ""
+                    a = item.get("a") or item.get("answer") or item.get("answer_text") or item.get("answer") or ""
+                else:
+                    q = f"faq_{i}"
+                    a = str(item)
+                normalized_faqs.append({"id": f"faq_{i}", "q": q, "a": a})
+            COMPANY_CONTENT["faqs"] = normalized_faqs
 
-def _set_tutor_concept(session, concept_id: str) -> Dict[str, Any]:
-    tutor = _ensure_tutor_state(session)
-    if concept_id in TUTOR_BY_ID:
-        tutor["concept_id"] = concept_id
+            # Pricing: convert to simple list of summaries if present
+            pricing_raw = raw.get("pricing") or {}
+            pricing_summary = []
+            if isinstance(pricing_raw, dict):
+                for product, note in pricing_raw.items():
+                    pricing_summary.append({"product": product, "note": str(note)})
+            elif isinstance(pricing_raw, list):
+                pricing_summary = pricing_raw
+            COMPANY_CONTENT["pricing_summary"] = pricing_summary
+
+            # Meta: keep other keys tucked away
+            meta_keys = {k: v for k, v in raw.items() if k not in ("company", "description", "short_description", "faq", "faqs", "pricing", "pricing_summary")}
+            if meta_keys:
+                COMPANY_CONTENT["meta"] = meta_keys
     else:
-        tutor["concept_id"] = _default_concept_id()
-    return tutor
+        logger.warning("Loaded company_faq.json but it's not a dict; got %s", type(raw))
+        # leave default COMPANY_CONTENT
 
+    # Final fallbacks
+    if "faqs" not in COMPANY_CONTENT:
+        COMPANY_CONTENT["faqs"] = []
+    if "pricing_summary" not in COMPANY_CONTENT:
+        COMPANY_CONTENT["pricing_summary"] = []
 
-def _get_active_concept(session) -> Dict[str, str]:
-    tutor = _ensure_tutor_state(session)
-    cid = tutor.get("concept_id") or _default_concept_id()
-    return TUTOR_BY_ID.get(cid, TUTOR_CONCEPTS[0])
+    FAQ_LIST = COMPANY_CONTENT.get("faqs", [])
+    logger.info("Loaded company content. Company name=%s, #faqs=%d, #pricing_items=%d",
+                _safe_company_field("name"), len(FAQ_LIST), len(COMPANY_CONTENT.get("pricing_summary", [])))
 
+# attempt to load at import time (keep previous behavior)
+try:
+    load_company_content()
+except Exception as e:
+    logger.exception("Failed loading company content: %s", e)
+    COMPANY_CONTENT = {"company": {"name": "Unknown", "short_description": ""}, "faqs": [], "pricing_summary": []}
+    FAQ_LIST = []
 
-# ---------- Murf Falcon TTS voices ---------- #
-# NOTE: If your actual Murf voice IDs differ, just change the `voice=` strings.
-
-TTS_MATTHEW = murf.TTS(
-    voice="en-US-matthew",  # Learn mode voice
+# ---------- TTS voices (reuse Murf config you had) ---------- #
+TTS_SDR = murf.TTS(
+    voice="en-US-matthew",
     style="Conversation",
     tokenizer=tokenize.basic.SentenceTokenizer(min_sentence_len=2),
     text_pacing=True,
 )
 
-TTS_ALICIA = murf.TTS(
-    voice="en-US-alicia",  # Quiz mode voice
-    style="Conversation",
-    tokenizer=tokenize.basic.SentenceTokenizer(min_sentence_len=2),
-    text_pacing=True,
-)
+# ---------- Helpers: FAQ search & lead state ---------- #
 
-TTS_KEN = murf.TTS(
-    voice="en-US-ken",  # Teach-back mode voice
-    style="Conversation",
-    tokenizer=tokenize.basic.SentenceTokenizer(min_sentence_len=2),
-    text_pacing=True,
-)
-
-TTS_ROUTER = TTS_MATTHEW  # router / greeting voice
-
-
-# ---------- Base tutor agent with tools ---------- #
-
-class BaseTutorAgent(Agent):
+def faq_lookup(query: str) -> Optional[Dict[str, str]]:
     """
-    Shared logic for the three modes + router.
-    Handles:
-      - access to JSON content
-      - tools: switch_mode, set_concept
+    Very simple keyword match: return the first FAQ where any keyword appears in question or answer.
+    """
+    q = query.lower()
+    for faq in FAQ_LIST:
+        if q in faq.get("q", "").lower() or q in faq.get("a", "").lower():
+            return faq
+    # try keyword match of words
+    words = [w for w in q.split() if len(w) > 3]
+    for faq in FAQ_LIST:
+        text = (faq.get("q", "") + " " + faq.get("a", "")).lower()
+        if any(w in text for w in words):
+            return faq
+    return None
+
+def _ensure_lead_state(session) -> Dict[str, Any]:
+    ud = session.userdata
+    lead = ud.get("lead")
+    if not isinstance(lead, dict):
+        lead = {
+            "name": None,
+            "company": None,
+            "email": None,
+            "role": None,
+            "use_case": None,
+            "team_size": None,
+            "timeline": None
+        }
+        ud["lead"] = lead
+    return lead
+
+def _save_lead_to_file(lead: Dict[str, Any]) -> str:
+    # make filename safe
+    name_part = (lead.get("email") or lead.get("name") or "lead").replace(" ", "_").replace("@", "_at_")
+    ts = datetime.datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+    path = os.path.join(LEADS_DIR, f"{ts}_{name_part}.json")
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump({"lead": lead, "company": COMPANY_CONTENT.get("company")}, f, indent=2)
+    return path
+
+# ---------- SDR Agent ---------- #
+
+# ---------- SDR Agent (patched to proactively collect leads) ---------- #
+
+class SDRAgent(Agent):
+    """
+    Voice SDR agent for a single product/company.
+    Tools:
+      - answer_faq: answer product/company/pricing questions from loaded FAQ
+      - collect_lead: store lead fields as they are provided
+      - save_lead: persist lead to disk and return path
+
+    Behavior notes:
+      - Actively ask for lead details when the caller shows interest.
+      - Use the collect_lead tool to record each field as soon as the user provides it.
+      - When all required fields are captured OR the user says "I'm done"/"Thanks",
+        call save_lead to persist and return a final summary.
     """
 
-    def __init__(
-        self,
-        mode: Literal["welcome", "learn", "quiz", "teach_back"],
-        *,
-        tts,
-        extra_mode_instructions: str = "",
-        **kwargs,
-    ) -> None:
+    REQUIRED_LEAD_FIELDS = ["name", "company", "email"]  # minimal required to save
+    OPTIONAL_LEAD_FIELDS = ["role", "use_case", "team_size", "timeline"]
+    ALL_LEAD_FIELDS = REQUIRED_LEAD_FIELDS + OPTIONAL_LEAD_FIELDS
+
+    def __init__(self, *, tts=None, extra_instructions: str = "", **kwargs):
+        company_name = _safe_company_field("name", "Unknown")
+        company_short = _safe_company_field("short_description", "")
+
+        # Clear, prescriptive instructions so the LLM will call the tools in a deterministic flow.
         base_instructions = f"""
-You are part of a multi-agent **Teach-the-Tutor: Active Recall Coach**.
+You are an SDR (sales development rep) voice agent for this company:
 
-There are three learning modes:
-- learn      → explain a concept clearly using the JSON content.
-- quiz       → ask short questions and give feedback.
-- teach_back → the user explains the concept back, you give qualitative feedback.
+Company: {company_name}
+Short description: {company_short}
 
-Course content (DO NOT invent new concepts; only use these):
+Goals:
+1) Understand the caller's needs by asking 'What brought you here today?' and a short follow-up.
+2) If the caller shows interest in evaluating the product or requests pricing/demo, OFFER to capture a few quick details to pass to Sales.
+3) Collect lead fields in this natural order: name, company, email, role, use_case, team_size, timeline.
+   - Ask one question at a time.
+   - After the user answers, call the tool `collect_lead(field, value)` with the field name and the user's value.
+   - If the user replies with multiple fields at once (e.g. "I'm Alice from Acme, email alice@acme.com"), call `collect_lead` for each parsed field.
+4) Once all REQUIRED fields (name OR email) are present, you may ask whether they'd like a demo or schedule a meeting.
+5) If the user says "that's all", "thanks", "I’m done", or you have all required fields, call the tool `save_lead()` and then read a short verbal summary:
+   - Example summary: "Thanks — I saved Alice (Acme), alice@acme.com. Use case: CRM evaluation for a 10-person team, timeline: soon. I'll pass this to sales."
+6) ALWAYS answer product/pricing/company questions from the loaded FAQ using the tool `answer_faq(question)` and never invent precise pricing or limits not present in FAQ. If FAQ lacks the detail, say you don't have that info and offer to connect to sales or schedule a demo.
 
-{TUTOR_CONTENT_STR}
+Tool usage rules (be explicit and consistent):
+- To answer product questions: call `answer_faq(question)` and return that tool output to the caller.
+- To store lead info: call `collect_lead(field, value)` where field is one of: {', '.join(self.ALL_LEAD_FIELDS)}.
+- To persist: call `save_lead()` when the user is done or required fields are collected.
 
-General rules:
-- Always focus on ONE concept at a time.
-- Respect the active concept from state unless the user explicitly asks to switch.
-- Keep responses short and conversational, 1 main idea per turn.
-- If the user asks to "learn", "quiz me", "let me teach it back", or "switch to X",
-  then call the `switch_mode` tool.
-- If the user names a specific concept (e.g. 'variables', 'loops'), call `set_concept`.
+Dialog examples (use these styles, but keep it short and conversational):
+- Greeting: "Hi — I'm an SDR for {company_name}. What brought you here today?"
+- Offer to capture details: "If you'd like, I can quickly take a few details so our sales team can follow up — can I get your name?"
+- After saved: "Thanks — I've saved [name] ([company]), [email]. I'll pass this to our sales team."
 
-Current mode: {mode}
-
-Mode-specific behavior:
-{extra_mode_instructions}
+{extra_instructions}
 """
-        super().__init__(instructions=base_instructions, tts=tts, **kwargs)
+        super().__init__(instructions=base_instructions, tts=tts or TTS_SDR, **kwargs)
 
-    # ---------------- TOOLS (shared in all modes) ---------------- #
-
-    @function_tool()
-    async def switch_mode(
-        self,
-        context: RunContext,
-        mode: Literal["learn", "quiz", "teach_back"],
-        concept_id: Optional[str] = None,
-    ):
-        """
-        Switch between learn, quiz, and teach_back modes.
-        Use this whenever the user asks to change modes.
-        """
-
-        session = context.session
-        tutor = _ensure_tutor_state(session)
-
-        # Decide which concept to use
-        if concept_id is None:
-            concept_id = tutor.get("concept_id") or _default_concept_id()
-
-        if concept_id not in TUTOR_BY_ID:
-            concept_id = _default_concept_id()
-
-        # Update state
-        _set_tutor_mode(session, mode, concept_id)
-
-        # Decide new agent
-        if mode == "learn":
-            new_agent = LearnAgent()
-        elif mode == "quiz":
-            new_agent = QuizAgent()
-        else:
-            new_agent = TeachBackAgent()
-
-        # Return BOTH the new agent (handoff) and a small textual result
-        # (the text is visible to the LLM, the agent handoff is handled by LiveKit)
-        return new_agent, f"Switching to {mode} mode for concept '{concept_id}'."
-
+    # ----------------- Tools ----------------- #
 
     @function_tool()
-    async def set_concept(
-        self,
-        context: RunContext,
-        concept_id: str,
-    ) -> str:
+    async def answer_faq(self, context: RunContext, question: str) -> str:
+        """Return answer from our FAQ list, or a safe fallback if not found."""
+        faq = faq_lookup(question)
+        if faq:
+            return faq["a"]
+        short = _safe_company_field("short_description", "")
+        if short and any(w in question.lower() for w in ["what do you do", "what is", "about your product", "what does your product do"]):
+            return short
+        return "I don't have that information in my FAQ. I can book a demo or take your details and connect you with a sales rep."
+
+    @function_tool()
+    async def collect_lead(self, context: RunContext, field: str, value: str) -> str:
         """
-        Set the active concept by id ('variables', 'loops', etc.).
-        Call when the user explicitly asks for a concept.
+        Save one lead field. field should be one of the keys in lead state.
         """
         session = context.session
-        if concept_id not in TUTOR_BY_ID:
-            valid = ", ".join(TUTOR_BY_ID.keys())
-            return f"Unknown concept id '{concept_id}'. Valid ids: {valid}."
+        lead = _ensure_lead_state(session)
+        if field not in lead:
+            return f"Unknown field '{field}'. Valid fields: {', '.join(lead.keys())}"
+        lead[field] = value
+        return f"Noted: {field} set."
 
-        _set_tutor_concept(session, concept_id)
-        return f"Great, we'll focus on '{concept_id}' now."
+    @function_tool()
+    async def save_lead(self, context: RunContext) -> str:
+        """
+        Save the lead JSON to disk and return the file path.
+        """
+        session = context.session
+        lead = _ensure_lead_state(session)
+        # require at least name or email
+        if not (lead.get("email") or lead.get("name")):
+            return "I need at least a name or email to save the lead. Could you provide one?"
+        path = _save_lead_to_file(lead)
+        return f"Saved lead to {path}"
 
-
-# ---------- Router agent (entrypoint) ---------- #
-
-class RouterAgent(BaseTutorAgent):
-    """
-    First agent the user meets.
-    Greets, explains modes, asks what they want, then hands off.
-    """
-
-    def __init__(self, **kwargs):
-        super().__init__(
-            mode="welcome",
-            tts=TTS_ROUTER,
-            extra_mode_instructions="""
-- Greet the learner.
-- Briefly describe the three modes: learn, quiz, teach_back.
-- Ask which mode they want to start with and which concept (e.g. 'variables' or 'loops').
-- After they reply, call `switch_mode` with their chosen mode and concept_id.
-- Once you call `switch_mode`, you don't continue talking; the new agent takes over.
-""",
-            **kwargs,
-        )
-
+    # ----------------- Conversation entry ----------------- #
     async def on_enter(self) -> None:
-        # Kick off the greeting turn
+        # Greet and ask first question to start the flow.
         await self.session.generate_reply(
             instructions=(
-                "Greet the learner. Explain that you have three modes: "
-                "learn (I explain), quiz (I question you), and teach_back (you explain). "
-                "Ask: which mode do you want to start with, and which concept — "
-                "variables or loops?"
+                "Greet the caller warmly as the SDR for the company and ask: "
+                "'Hi — I'm an SDR for {company_name}. What brought you here today, and what are you working on?'\n\n"
+                "If the user expresses interest in evaluating the product or asks pricing/demo, say: "
+                "'Great — I can quickly capture a few details so our sales team can follow up. May I have your name?' "
+                "Then WAIT for user response. When the user answers with name, call the `collect_lead` tool."
             )
         )
 
 
-# ---------- Learn mode agent (Matthew) ---------- #
-
-class LearnAgent(BaseTutorAgent):
-    def __init__(self, **kwargs):
-        super().__init__(
-            mode="learn",
-            tts=TTS_MATTHEW,
-            extra_mode_instructions="""
-In learn mode:
-- Focus on the active concept from state.
-- Use that concept's `summary` as the backbone of your explanation.
-- Explain in clear, friendly language with 1–2 short, concrete examples.
-- After a short explanation, ask something like:
-  - "Want me to quiz you on this?"
-  - "Should we switch to teach-back so you explain it to me?"
-""",
-            **kwargs,
-        )
-
-    async def on_enter(self) -> None:
-        concept = _get_active_concept(self.session)
-        await self.session.generate_reply(
-            instructions=(
-                "Introduce yourself as the Learn mode tutor using Matthew's voice. "
-                f"Tell the learner you'll start with the concept '{concept['title']}'. "
-                "Give a short, high-level explanation of the concept and ask if "
-                "they want more detail or would like to be quizzed."
-            )
-        )
-
-
-# ---------- Quiz mode agent (Alicia) ---------- #
-
-class QuizAgent(BaseTutorAgent):
-    def __init__(self, **kwargs):
-        super().__init__(
-            mode="quiz",
-            tts=TTS_ALICIA,
-            extra_mode_instructions="""
-In quiz mode:
-- Ask ONE short question at a time, based on the concept's `sample_question`
-  and small variations of it.
-- Wait for the user's answer before giving feedback.
-- Feedback should be brief: what they got right, what they missed.
-- Then either:
-  - ask a follow-up question, or
-  - suggest switching to teach_back or learn if they seem unsure.
-""",
-            **kwargs,
-        )
-
-    async def on_enter(self) -> None:
-        concept = _get_active_concept(self.session)
-        await self.session.generate_reply(
-            instructions=(
-                "Introduce yourself as the Quiz mode tutor using Alicia's voice. "
-                f"Confirm you're quizzing them on '{concept['title']}'. "
-                "Ask one short question based on the concept's sample_question, "
-                "and wait for their answer."
-            )
-        )
-
-
-# ---------- Teach-back mode agent (Ken) ---------- #
-
-class TeachBackAgent(BaseTutorAgent):
-    def __init__(self, **kwargs):
-        super().__init__(
-            mode="teach_back",
-            tts=TTS_KEN,
-            extra_mode_instructions="""
-In teach_back mode:
-- Ask the learner to explain the concept in their own words.
-- Let them finish before responding.
-- Give 1–3 sentences of qualitative feedback:
-  - What they explained well.
-  - What they missed or could clarify.
-- Optionally suggest whether they should:
-  - go back to learn for more explanation, or
-  - keep quizzing.
-""",
-            **kwargs,
-        )
-
-    async def on_enter(self) -> None:
-        concept = _get_active_concept(self.session)
-        await self.session.generate_reply(
-            instructions=(
-                "Introduce yourself as the Teach-back coach using Ken's voice. "
-                f"Ask the learner to explain '{concept['title']}' in their own words. "
-                "Encourage them to cover the main idea and at least one example."
-            )
-        )
-
-
-# ---------- Prewarm (VAD) ---------- #
+# ---------- Entrypoint and session setup ---------- #
 
 def prewarm(proc: JobProcess):
     proc.userdata["vad"] = silero.VAD.load()
 
-
-# ---------- Entrypoint ---------- #
-
 async def entrypoint(ctx: JobContext):
-    # Logging context
-    ctx.log_context_fields = {
-        "room": ctx.room.name,
-    }
-
+    ctx.log_context_fields = {"room": ctx.room.name}
     session = AgentSession(
         stt=deepgram.STT(model="nova-3"),
-        llm=google.LLM(
-            model="gemini-2.5-flash",
-        ),
-        # Default TTS (router / fallback) – individual agents override this
-        tts=TTS_MATTHEW,
+        llm=google.LLM(model="gemini-2.5-flash"),
+        tts=TTS_SDR,
         turn_detection=MultilingualModel(),
         vad=ctx.proc.userdata["vad"],
         preemptive_generation=True,
     )
-
-    # Initialize userdata; tutor state lives under session.userdata["tutor"]
     session.userdata = {}
-
     usage_collector = metrics.UsageCollector()
-
     @session.on("metrics_collected")
     def _on_metrics_collected(ev: MetricsCollectedEvent):
         metrics.log_metrics(ev.metrics)
         usage_collector.collect(ev.metrics)
-
     async def log_usage():
         summary = usage_collector.get_summary()
         logger.info(f"Usage: {summary}")
-
     ctx.add_shutdown_callback(log_usage)
-
-    # Start with RouterAgent → it will hand off to learn/quiz/teach_back
+    # start SDR
     await session.start(
-        agent=RouterAgent(),
+        agent=SDRAgent(),
         room=ctx.room,
         room_input_options=RoomInputOptions(
             noise_cancellation=noise_cancellation.BVC(),
         ),
     )
-
     await ctx.connect()
-
 
 if __name__ == "__main__":
     cli.run_app(WorkerOptions(entrypoint_fnc=entrypoint, prewarm_fnc=prewarm))
