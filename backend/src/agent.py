@@ -1,8 +1,7 @@
 import logging
 import os
 import json
-import datetime
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Literal
 
 from dotenv import load_dotenv
 from livekit import rtc
@@ -30,230 +29,379 @@ logger = logging.getLogger("agent")
 
 load_dotenv(".env.local")
 
-# ----- FIXED: make the log path absolute at project root -----
+# ---------- Paths ---------- #
+
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-WELLNESS_LOG_PATH = os.path.join(BASE_DIR, "wellness_log.json")
-# -------------------------------------------------------------
+TUTOR_CONTENT_PATH = os.path.join(BASE_DIR, "shared-data", "day4_tutor_content.json")
+
+# ---------- Load tutor content from JSON ---------- #
+
+TUTOR_CONCEPTS: List[Dict[str, str]] = []
+TUTOR_BY_ID: Dict[str, Dict[str, str]] = {}
+TUTOR_CONTENT_STR: str = ""
 
 
-def _read_wellness_log() -> List[Dict[str, Any]]:
-    """Internal helper: read JSON log, return list of entries."""
-    if not os.path.exists(WELLNESS_LOG_PATH):
-        return []
+def _load_tutor_content() -> None:
+    global TUTOR_CONCEPTS, TUTOR_BY_ID, TUTOR_CONTENT_STR
 
-    try:
-        with open(WELLNESS_LOG_PATH, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        if isinstance(data, list):
-            return data
-        # If corrupted / wrong type, back it up and start fresh
-        backup_path = WELLNESS_LOG_PATH + ".backup"
-        with open(backup_path, "w", encoding="utf-8") as bf:
-            json.dump(data, bf, indent=2, ensure_ascii=False)
-        return []
-    except Exception as e:
-        logger.warning(f"Failed to read wellness log: {e}")
-        return []
-
-
-def _write_wellness_log(entries: List[Dict[str, Any]]) -> None:
-    """Internal helper: write list of entries back to JSON log."""
-    try:
-        with open(WELLNESS_LOG_PATH, "w", encoding="utf-8") as f:
-            json.dump(entries, f, indent=2, ensure_ascii=False)
-    except Exception as e:
-        logger.error(f"Failed to write wellness log: {e}")
-
-
-class Assistant(Agent):
-    def __init__(self) -> None:
-        super().__init__(
-            instructions="""
-You are a short, practical daily health & wellness check-in companion called "Nudge".
-
-Your job:
-- Have a brief, focused check-in with the user once per day (around 5–10 minutes).
-- Ask about mood, energy, and any current stressors.
-- Help them pick 1–3 realistic, concrete objectives for the day.
-- Offer simple, non-medical suggestions.
-- Summarize and confirm what you heard at the end.
-
-VERY IMPORTANT SAFETY RULES:
-- You are NOT a doctor, therapist, or crisis counselor.
-- Do NOT diagnose conditions, suggest medications, or interpret symptoms.
-- Do NOT give medical, psychiatric, or nutritional prescriptions.
-- If the user mentions self-harm, suicidal thoughts, or extreme distress:
-  - Acknowledge their feelings with warmth.
-  - Clearly say you are not a professional.
-  - Encourage them to immediately reach out to a trusted person or local emergency/mental health services.
-  - Keep your language supportive and non-judgmental.
-
-TOOLS YOU CAN USE:
-1) `get_wellness_history(limit)`:
-   - Call once near the start of the conversation.
-   - It returns the most recent past check-ins (if any).
-   - Use this to make at least ONE small reference to past days, for example:
-     - "Last time you said your energy was low. How does today compare?"
-     - "You wanted to focus on sleep last time. Did that help at all?"
-
-2) `log_wellness_check(mood, energy, stressors, objectives, agent_summary)`:
-
-   - At the END of EVERY conversation, after you recap and the user confirms,
-     you MUST call this tool EXACTLY ONE TIME.
-
-   - This tool call is REQUIRED for every daily check-in. Never skip it.
-
-   - Fill the arguments as follows:
-       • mood: short text describing how the user said they feel
-       • energy: integer 1–10 (convert their answer to a number)
-       • stressors: short text or null
-       • objectives: 1–3 goals stated by the user
-       • agent_summary: 1–3 sentences summarizing the check-in
-
-   - After calling this tool, your job is done and you should not continue
-     the conversation.
-
-
-CONVERSATION FLOW (DEFAULT):
-
-1) Warm open:
-   - Greet briefly.
-   - If history exists (via `get_wellness_history`), reference it naturally.
-   - Example: "Hey, good to see you again. Last time you were pretty drained. How are you feeling today?"
-
-2) Mood and energy:
-   - Ask open-ended AND simple-scale questions, e.g.:
-     - "How are you feeling today overall?"
-     - "On a scale from 1 to 10, where is your energy right now?"
-     - "Anything stressing you out at the moment?"
-   - Reflect back in simple language: "Sounds like you're a bit anxious but still functioning."
-
-3) Intentions / objectives for today:
-   - Ask for 1–3 concrete things:
-     - "What are 1–3 things you’d like to get done today?"
-     - "Is there anything you want to do just for yourself? (rest, exercise, hobbies, calling someone, etc.)"
-   - If goals are vague, help make them smaller and more specific:
-     - “Instead of ‘study a lot’, maybe ‘do 2 focused 25-minute study blocks’.”
-
-4) Simple, realistic suggestions:
-   - Offer small, optional ideas. Keep it grounded:
-     - break big tasks into smaller steps
-     - short breaks
-     - 5–10 minute walk or stretch
-     - drink water, light snack
-   - Do NOT overcomplicate or push too hard; suggestions should feel doable TODAY.
-
-5) Recap and confirmation:
-   - Summarize in 2–4 sentences:
-     - How they are feeling (mood + energy)
-     - The 1–3 main objectives
-     - Any tiny self-care step you agreed on.
-   - Example:
-     - "So today you’re feeling a bit tired but motivated, energy around 6/10.
-        Your focus is: finish your report draft, go for a 10-minute walk,
-        and try to get to bed before midnight."
-   - Ask: "Does this sound right?" and briefly adjust if needed.
-   - Then close gently: wish them luck, and remind them it’s okay if not everything gets done.
-
-STYLE:
-- Calm, grounded, and human.
-- Short paragraphs and simple language.
-- Never guilt-trip or judge the user.
-- If they didn’t follow through on past goals, respond with curiosity, not blame:
-  - "No worries, that happens. Do you want to keep that goal or adjust it for today?"
-
-Remember: your primary job is to be a short, supportive check-in, not a therapist, coach, or productivity drill sergeant.
-""",
+    if not os.path.exists(TUTOR_CONTENT_PATH):
+        raise FileNotFoundError(
+            f"Tutor content JSON not found at {TUTOR_CONTENT_PATH}. "
+            f"Create it with the concepts for Day 4."
         )
 
-    @function_tool()
-    async def get_wellness_history(
-        self,
-        context: RunContext,
-        limit: int = 3,
-    ) -> List[Dict[str, Any]]:
-        """
-        Return up to `limit` most recent wellness check-ins.
+    with open(TUTOR_CONTENT_PATH, "r", encoding="utf-8") as f:
+        data = json.load(f)
 
-        Each entry has this shape:
-        {
-          "timestamp": ISO-8601 string,
-          "mood": str,
-          "energy": int,
-          "stressors": str or null,
-          "objectives": [str, ...],
-          "agent_summary": str
-        }
-        """
-        entries = _read_wellness_log()
-        if limit <= 0:
-            return []
+    if not isinstance(data, list):
+        raise ValueError("day4_tutor_content.json must be a list of concept objects.")
 
-        # newest first
-        entries_sorted = sorted(
-            entries,
-            key=lambda e: e.get("timestamp", ""),
-            reverse=True,
+    TUTOR_CONCEPTS = []
+    for item in data:
+        if not all(k in item for k in ("id", "title", "summary", "sample_question")):
+            raise ValueError("Each concept must have id, title, summary, sample_question.")
+        TUTOR_CONCEPTS.append(
+            {
+                "id": item["id"],
+                "title": item["title"],
+                "summary": item["summary"],
+                "sample_question": item["sample_question"],
+            }
         )
-        recent = entries_sorted[:limit]
 
-        # store last history in session if you ever want it
-        context.session.userdata["recent_wellness_history"] = recent
-        return recent
+    TUTOR_BY_ID = {c["id"]: c for c in TUTOR_CONCEPTS}
+
+    lines = []
+    for c in TUTOR_CONCEPTS:
+        lines.append(
+            f"- id: {c['id']}\n"
+            f"  title: {c['title']}\n"
+            f"  summary: {c['summary']}\n"
+            f"  sample_question: {c['sample_question']}"
+        )
+    TUTOR_CONTENT_STR = "\n".join(lines)
+
+
+def _default_concept_id() -> str:
+    return TUTOR_CONCEPTS[0]["id"] if TUTOR_CONCEPTS else "variables"
+
+
+_load_tutor_content()
+
+
+# ---------- Tutor state helpers (stored in session.userdata["tutor"]) ---------- #
+
+def _ensure_tutor_state(session) -> Dict[str, Any]:
+    ud = session.userdata
+    tutor = ud.get("tutor")
+    if not isinstance(tutor, dict):
+        tutor = {}
+        ud["tutor"] = tutor
+
+    if "mode" not in tutor:
+        tutor["mode"] = "welcome"
+    if "concept_id" not in tutor:
+        tutor["concept_id"] = _default_concept_id()
+
+    return tutor
+
+
+def _set_tutor_mode(session, mode: str, concept_id: Optional[str] = None) -> Dict[str, Any]:
+    tutor = _ensure_tutor_state(session)
+    tutor["mode"] = mode
+    if concept_id is not None:
+        if concept_id in TUTOR_BY_ID:
+            tutor["concept_id"] = concept_id
+        else:
+            tutor["concept_id"] = _default_concept_id()
+    return tutor
+
+
+def _set_tutor_concept(session, concept_id: str) -> Dict[str, Any]:
+    tutor = _ensure_tutor_state(session)
+    if concept_id in TUTOR_BY_ID:
+        tutor["concept_id"] = concept_id
+    else:
+        tutor["concept_id"] = _default_concept_id()
+    return tutor
+
+
+def _get_active_concept(session) -> Dict[str, str]:
+    tutor = _ensure_tutor_state(session)
+    cid = tutor.get("concept_id") or _default_concept_id()
+    return TUTOR_BY_ID.get(cid, TUTOR_CONCEPTS[0])
+
+
+# ---------- Murf Falcon TTS voices ---------- #
+# NOTE: If your actual Murf voice IDs differ, just change the `voice=` strings.
+
+TTS_MATTHEW = murf.TTS(
+    voice="en-US-matthew",  # Learn mode voice
+    style="Conversation",
+    tokenizer=tokenize.basic.SentenceTokenizer(min_sentence_len=2),
+    text_pacing=True,
+)
+
+TTS_ALICIA = murf.TTS(
+    voice="en-US-alicia",  # Quiz mode voice
+    style="Conversation",
+    tokenizer=tokenize.basic.SentenceTokenizer(min_sentence_len=2),
+    text_pacing=True,
+)
+
+TTS_KEN = murf.TTS(
+    voice="en-US-ken",  # Teach-back mode voice
+    style="Conversation",
+    tokenizer=tokenize.basic.SentenceTokenizer(min_sentence_len=2),
+    text_pacing=True,
+)
+
+TTS_ROUTER = TTS_MATTHEW  # router / greeting voice
+
+
+# ---------- Base tutor agent with tools ---------- #
+
+class BaseTutorAgent(Agent):
+    """
+    Shared logic for the three modes + router.
+    Handles:
+      - access to JSON content
+      - tools: switch_mode, set_concept
+    """
+
+    def __init__(
+        self,
+        mode: Literal["welcome", "learn", "quiz", "teach_back"],
+        *,
+        tts,
+        extra_mode_instructions: str = "",
+        **kwargs,
+    ) -> None:
+        base_instructions = f"""
+You are part of a multi-agent **Teach-the-Tutor: Active Recall Coach**.
+
+There are three learning modes:
+- learn      → explain a concept clearly using the JSON content.
+- quiz       → ask short questions and give feedback.
+- teach_back → the user explains the concept back, you give qualitative feedback.
+
+Course content (DO NOT invent new concepts; only use these):
+
+{TUTOR_CONTENT_STR}
+
+General rules:
+- Always focus on ONE concept at a time.
+- Respect the active concept from state unless the user explicitly asks to switch.
+- Keep responses short and conversational, 1 main idea per turn.
+- If the user asks to "learn", "quiz me", "let me teach it back", or "switch to X",
+  then call the `switch_mode` tool.
+- If the user names a specific concept (e.g. 'variables', 'loops'), call `set_concept`.
+
+Current mode: {mode}
+
+Mode-specific behavior:
+{extra_mode_instructions}
+"""
+        super().__init__(instructions=base_instructions, tts=tts, **kwargs)
+
+    # ---------------- TOOLS (shared in all modes) ---------------- #
 
     @function_tool()
-    async def log_wellness_check(
+    async def switch_mode(
         self,
         context: RunContext,
-        mood: str,
-        energy: int,
-        stressors: Optional[str],
-        objectives: List[str],
-        agent_summary: str,
+        mode: Literal["learn", "quiz", "teach_back"],
+        concept_id: Optional[str] = None,
+    ):
+        """
+        Switch between learn, quiz, and teach_back modes.
+        Use this whenever the user asks to change modes.
+        """
+
+        session = context.session
+        tutor = _ensure_tutor_state(session)
+
+        # Decide which concept to use
+        if concept_id is None:
+            concept_id = tutor.get("concept_id") or _default_concept_id()
+
+        if concept_id not in TUTOR_BY_ID:
+            concept_id = _default_concept_id()
+
+        # Update state
+        _set_tutor_mode(session, mode, concept_id)
+
+        # Decide new agent
+        if mode == "learn":
+            new_agent = LearnAgent()
+        elif mode == "quiz":
+            new_agent = QuizAgent()
+        else:
+            new_agent = TeachBackAgent()
+
+        # Return BOTH the new agent (handoff) and a small textual result
+        # (the text is visible to the LLM, the agent handoff is handled by LiveKit)
+        return new_agent, f"Switching to {mode} mode for concept '{concept_id}'."
+
+
+    @function_tool()
+    async def set_concept(
+        self,
+        context: RunContext,
+        concept_id: str,
     ) -> str:
         """
-        Append a new wellness check-in entry to wellness_log.json.
+        Set the active concept by id ('variables', 'loops', etc.).
+        Call when the user explicitly asks for a concept.
         """
-        logger.info(f"[log_wellness_check] called with mood={mood}, energy={energy}, "
-                    f"stressors={stressors}, objectives={objectives}")
+        session = context.session
+        if concept_id not in TUTOR_BY_ID:
+            valid = ", ".join(TUTOR_BY_ID.keys())
+            return f"Unknown concept id '{concept_id}'. Valid ids: {valid}."
 
-        # basic safety for input
-        try:
-            energy_int = int(energy)
-        except Exception:
-            energy_int = 0
-
-        if not isinstance(objectives, list):
-            objectives = [str(objectives)]
-
-        timestamp = datetime.datetime.now(datetime.timezone.utc).isoformat()
-
-        entry: Dict[str, Any] = {
-            "timestamp": timestamp,
-            "mood": mood,
-            "energy": energy_int,
-            "stressors": stressors,
-            "objectives": objectives,
-            "agent_summary": agent_summary,
-        }
-
-        entries = _read_wellness_log()
-        entries.append(entry)
-        _write_wellness_log(entries)
-
-        context.session.userdata["last_wellness_entry"] = entry
-
-        logger.info(f"[log_wellness_check] wrote entry to {WELLNESS_LOG_PATH}")
-        return f"Logged wellness check for {timestamp} with {len(objectives)} objectives."
+        _set_tutor_concept(session, concept_id)
+        return f"Great, we'll focus on '{concept_id}' now."
 
 
+# ---------- Router agent (entrypoint) ---------- #
+
+class RouterAgent(BaseTutorAgent):
+    """
+    First agent the user meets.
+    Greets, explains modes, asks what they want, then hands off.
+    """
+
+    def __init__(self, **kwargs):
+        super().__init__(
+            mode="welcome",
+            tts=TTS_ROUTER,
+            extra_mode_instructions="""
+- Greet the learner.
+- Briefly describe the three modes: learn, quiz, teach_back.
+- Ask which mode they want to start with and which concept (e.g. 'variables' or 'loops').
+- After they reply, call `switch_mode` with their chosen mode and concept_id.
+- Once you call `switch_mode`, you don't continue talking; the new agent takes over.
+""",
+            **kwargs,
+        )
+
+    async def on_enter(self) -> None:
+        # Kick off the greeting turn
+        await self.session.generate_reply(
+            instructions=(
+                "Greet the learner. Explain that you have three modes: "
+                "learn (I explain), quiz (I question you), and teach_back (you explain). "
+                "Ask: which mode do you want to start with, and which concept — "
+                "variables or loops?"
+            )
+        )
+
+
+# ---------- Learn mode agent (Matthew) ---------- #
+
+class LearnAgent(BaseTutorAgent):
+    def __init__(self, **kwargs):
+        super().__init__(
+            mode="learn",
+            tts=TTS_MATTHEW,
+            extra_mode_instructions="""
+In learn mode:
+- Focus on the active concept from state.
+- Use that concept's `summary` as the backbone of your explanation.
+- Explain in clear, friendly language with 1–2 short, concrete examples.
+- After a short explanation, ask something like:
+  - "Want me to quiz you on this?"
+  - "Should we switch to teach-back so you explain it to me?"
+""",
+            **kwargs,
+        )
+
+    async def on_enter(self) -> None:
+        concept = _get_active_concept(self.session)
+        await self.session.generate_reply(
+            instructions=(
+                "Introduce yourself as the Learn mode tutor using Matthew's voice. "
+                f"Tell the learner you'll start with the concept '{concept['title']}'. "
+                "Give a short, high-level explanation of the concept and ask if "
+                "they want more detail or would like to be quizzed."
+            )
+        )
+
+
+# ---------- Quiz mode agent (Alicia) ---------- #
+
+class QuizAgent(BaseTutorAgent):
+    def __init__(self, **kwargs):
+        super().__init__(
+            mode="quiz",
+            tts=TTS_ALICIA,
+            extra_mode_instructions="""
+In quiz mode:
+- Ask ONE short question at a time, based on the concept's `sample_question`
+  and small variations of it.
+- Wait for the user's answer before giving feedback.
+- Feedback should be brief: what they got right, what they missed.
+- Then either:
+  - ask a follow-up question, or
+  - suggest switching to teach_back or learn if they seem unsure.
+""",
+            **kwargs,
+        )
+
+    async def on_enter(self) -> None:
+        concept = _get_active_concept(self.session)
+        await self.session.generate_reply(
+            instructions=(
+                "Introduce yourself as the Quiz mode tutor using Alicia's voice. "
+                f"Confirm you're quizzing them on '{concept['title']}'. "
+                "Ask one short question based on the concept's sample_question, "
+                "and wait for their answer."
+            )
+        )
+
+
+# ---------- Teach-back mode agent (Ken) ---------- #
+
+class TeachBackAgent(BaseTutorAgent):
+    def __init__(self, **kwargs):
+        super().__init__(
+            mode="teach_back",
+            tts=TTS_KEN,
+            extra_mode_instructions="""
+In teach_back mode:
+- Ask the learner to explain the concept in their own words.
+- Let them finish before responding.
+- Give 1–3 sentences of qualitative feedback:
+  - What they explained well.
+  - What they missed or could clarify.
+- Optionally suggest whether they should:
+  - go back to learn for more explanation, or
+  - keep quizzing.
+""",
+            **kwargs,
+        )
+
+    async def on_enter(self) -> None:
+        concept = _get_active_concept(self.session)
+        await self.session.generate_reply(
+            instructions=(
+                "Introduce yourself as the Teach-back coach using Ken's voice. "
+                f"Ask the learner to explain '{concept['title']}' in their own words. "
+                "Encourage them to cover the main idea and at least one example."
+            )
+        )
+
+
+# ---------- Prewarm (VAD) ---------- #
 
 def prewarm(proc: JobProcess):
     proc.userdata["vad"] = silero.VAD.load()
 
 
+# ---------- Entrypoint ---------- #
+
 async def entrypoint(ctx: JobContext):
-    # Logging setup
+    # Logging context
     ctx.log_context_fields = {
         "room": ctx.room.name,
     }
@@ -263,16 +411,14 @@ async def entrypoint(ctx: JobContext):
         llm=google.LLM(
             model="gemini-2.5-flash",
         ),
-        tts=murf.TTS(
-            voice="en-US-matthew",
-            style="Conversation",
-            tokenizer=tokenize.basic.SentenceTokenizer(min_sentence_len=2),
-            text_pacing=True,
-        ),
+        # Default TTS (router / fallback) – individual agents override this
+        tts=TTS_MATTHEW,
         turn_detection=MultilingualModel(),
         vad=ctx.proc.userdata["vad"],
         preemptive_generation=True,
     )
+
+    # Initialize userdata; tutor state lives under session.userdata["tutor"]
     session.userdata = {}
 
     usage_collector = metrics.UsageCollector()
@@ -288,8 +434,9 @@ async def entrypoint(ctx: JobContext):
 
     ctx.add_shutdown_callback(log_usage)
 
+    # Start with RouterAgent → it will hand off to learn/quiz/teach_back
     await session.start(
-        agent=Assistant(),
+        agent=RouterAgent(),
         room=ctx.room,
         room_input_options=RoomInputOptions(
             noise_cancellation=noise_cancellation.BVC(),

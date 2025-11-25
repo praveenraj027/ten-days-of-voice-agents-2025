@@ -1,14 +1,14 @@
 [
   {
-    "timestamp": "2025-11-23T16:16:04.119560+00:00",
-    "mood": "a bit tired",
+    "timestamp": "2025-11-23T16:35:43.509434+00:00",
+    "mood": "a bit tight and tired",
     "energy": 4,
-    "stressors": "getting stuck on DSC questions",
+    "stressors": "morning DSA work",
     "objectives": [
-      "listen to music",
-      "lie down with closed eyes",
-      "hang out with friends"
+      "Listen to music",
+      "Lie on bed with closed eyes",
+      "Go out and hang out with friends"
     ],
-    "agent_summary": "Today you are feeling a bit tired, energy around 4/10, due to challenging DSC questions. Your goals are to listen to music, lie down with closed eyes, and spontaneously hang out with friends."
+    "agent_summary": "The user is feeling tight and tired (4/10 energy) due to intense DSA work. Objectives include listening to music, resting with closed eyes, and hanging out with friends. Suggestions included setting timers for rest and short social outings."
   }
 ]
