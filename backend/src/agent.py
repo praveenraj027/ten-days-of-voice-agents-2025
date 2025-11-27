@@ -3,7 +3,9 @@ import logging
 import os
 import json
 import datetime
-from typing import Optional, List, Dict, Any, Literal
+import sqlite3
+import inspect
+from typing import Optional, List, Dict, Any
 
 from dotenv import load_dotenv
 from livekit import rtc
@@ -36,14 +38,15 @@ FAQ_PATH = os.path.join(DATA_DIR, "company_faq.json")
 LEADS_DIR = os.path.join(BASE_DIR, "leads")
 os.makedirs(LEADS_DIR, exist_ok=True)
 
+# ---------- Fraud DB config ---------- #
+FRAUD_DB_PATH = os.path.join(DATA_DIR, "fraud_cases.db")
+os.makedirs(DATA_DIR, exist_ok=True)
+
 # -- Load company FAQ content (small in-memory RAG) -- #
 COMPANY_CONTENT: Dict[str, Any] = {}
 FAQ_LIST: List[Dict[str, str]] = []
 
 def _safe_company_field(field: str, default: str = "Unknown") -> str:
-    """
-    Safely return COMPANY_CONTENT['company'][field] if possible.
-    """
     try:
         if isinstance(COMPANY_CONTENT, dict):
             company = COMPANY_CONTENT.get("company", {})
@@ -54,56 +57,42 @@ def _safe_company_field(field: str, default: str = "Unknown") -> str:
     return default
 
 def load_company_content():
-    """
-    Load and normalize shared-data/company_faq.json into the expected schema:
-    {
-      "company": {"name": "...", "short_description": "..."},
-      "faqs": [ {"id":..., "q":..., "a":...}, ... ],
-      "pricing_summary": [...]
-    }
-    """
     global COMPANY_CONTENT, FAQ_LIST
     if not os.path.exists(FAQ_PATH):
-        raise FileNotFoundError(f"company_faq.json not found at {FAQ_PATH}. Create one from the provided JSON.")
+        # no FAQ, keep defaults
+        COMPANY_CONTENT = {"company": {"name": "Unknown", "short_description": ""}, "faqs": [], "pricing_summary": []}
+        FAQ_LIST = []
+        logger.info("No company_faq.json found at %s; continuing with defaults", FAQ_PATH)
+        return
 
     with open(FAQ_PATH, "r", encoding="utf-8") as f:
         raw = json.load(f)
 
-    # Start with a safe empty shape
     COMPANY_CONTENT = {"company": {"name": "Unknown", "short_description": ""}}
     COMPANY_CONTENT["faqs"] = []
     COMPANY_CONTENT["pricing_summary"] = []
 
     if isinstance(raw, dict):
-        # If already in expected schema (company is dict)
         if "company" in raw and isinstance(raw["company"], dict):
-            # Copy through but ensure keys exist
             COMPANY_CONTENT.update(raw)
-            if "faqs" not in COMPANY_CONTENT:
-                COMPANY_CONTENT["faqs"] = []
-            if "pricing_summary" not in COMPANY_CONTENT:
-                COMPANY_CONTENT["pricing_summary"] = raw.get("pricing_summary", [])
+            COMPANY_CONTENT["faqs"] = COMPANY_CONTENT.get("faqs", [])
+            COMPANY_CONTENT["pricing_summary"] = COMPANY_CONTENT.get("pricing_summary", [])
         else:
-            # Legacy flat schema: company as string + description, faq (list of dicts), pricing dict
             company_name = raw.get("company") if isinstance(raw.get("company"), str) else raw.get("company", "Unknown")
             company_desc = raw.get("description") or raw.get("short_description") or ""
             COMPANY_CONTENT["company"]["name"] = company_name
             COMPANY_CONTENT["company"]["short_description"] = company_desc
-
-            # FAQs: prefer 'faqs' but also accept 'faq'
             faqs_raw = raw.get("faqs") or raw.get("faq") or raw.get("faq_list") or []
             normalized_faqs = []
             for i, item in enumerate(faqs_raw):
                 if isinstance(item, dict):
-                    q = item.get("q") or item.get("question") or item.get("question_text") or item.get("question") or ""
-                    a = item.get("a") or item.get("answer") or item.get("answer_text") or item.get("answer") or ""
+                    q = item.get("q") or item.get("question") or item.get("question_text") or ""
+                    a = item.get("a") or item.get("answer") or item.get("answer_text") or ""
                 else:
                     q = f"faq_{i}"
                     a = str(item)
                 normalized_faqs.append({"id": f"faq_{i}", "q": q, "a": a})
             COMPANY_CONTENT["faqs"] = normalized_faqs
-
-            # Pricing: convert to simple list of summaries if present
             pricing_raw = raw.get("pricing") or {}
             pricing_summary = []
             if isinstance(pricing_raw, dict):
@@ -112,24 +101,14 @@ def load_company_content():
             elif isinstance(pricing_raw, list):
                 pricing_summary = pricing_raw
             COMPANY_CONTENT["pricing_summary"] = pricing_summary
-
-            # Meta: keep other keys tucked away
             meta_keys = {k: v for k, v in raw.items() if k not in ("company", "description", "short_description", "faq", "faqs", "pricing", "pricing_summary")}
             if meta_keys:
                 COMPANY_CONTENT["meta"] = meta_keys
     else:
         logger.warning("Loaded company_faq.json but it's not a dict; got %s", type(raw))
-        # leave default COMPANY_CONTENT
-
-    # Final fallbacks
-    if "faqs" not in COMPANY_CONTENT:
-        COMPANY_CONTENT["faqs"] = []
-    if "pricing_summary" not in COMPANY_CONTENT:
-        COMPANY_CONTENT["pricing_summary"] = []
 
     FAQ_LIST = COMPANY_CONTENT.get("faqs", [])
-    logger.info("Loaded company content. Company name=%s, #faqs=%d, #pricing_items=%d",
-                _safe_company_field("name"), len(FAQ_LIST), len(COMPANY_CONTENT.get("pricing_summary", [])))
+    logger.info("Loaded company content. Company name=%s, #faqs=%d", _safe_company_field("name"), len(FAQ_LIST))
 
 # attempt to load at import time (keep previous behavior)
 try:
@@ -140,24 +119,24 @@ except Exception as e:
     FAQ_LIST = []
 
 # ---------- TTS voices (reuse Murf config you had) ---------- #
-TTS_SDR = murf.TTS(
-    voice="en-US-matthew",
-    style="Conversation",
-    tokenizer=tokenize.basic.SentenceTokenizer(min_sentence_len=2),
-    text_pacing=True,
-)
+def make_murf_tts():
+    # create a fresh Murf TTS instance when called inside an event loop/task
+    return murf.TTS(
+        voice="en-US-matthew",
+        style="Conversation",
+        tokenizer=tokenize.basic.SentenceTokenizer(min_sentence_len=2),
+        text_pacing=True,
+        # If plugin accepts connection options, you can add them here.
+        # e.g. connection_options={"timeout": 30, "pool_size": 2}
+    )
 
-# ---------- Helpers: FAQ search & lead state ---------- #
 
+# ---------- Helpers: FAQ search & lead state (kept for compatibility) ---------- #
 def faq_lookup(query: str) -> Optional[Dict[str, str]]:
-    """
-    Very simple keyword match: return the first FAQ where any keyword appears in question or answer.
-    """
     q = query.lower()
     for faq in FAQ_LIST:
         if q in faq.get("q", "").lower() or q in faq.get("a", "").lower():
             return faq
-    # try keyword match of words
     words = [w for w in q.split() if len(w) > 3]
     for faq in FAQ_LIST:
         text = (faq.get("q", "") + " " + faq.get("a", "")).lower()
@@ -182,7 +161,6 @@ def _ensure_lead_state(session) -> Dict[str, Any]:
     return lead
 
 def _save_lead_to_file(lead: Dict[str, Any]) -> str:
-    # make filename safe
     name_part = (lead.get("email") or lead.get("name") or "lead").replace(" ", "_").replace("@", "_at_")
     ts = datetime.datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
     path = os.path.join(LEADS_DIR, f"{ts}_{name_part}.json")
@@ -190,152 +168,309 @@ def _save_lead_to_file(lead: Dict[str, Any]) -> str:
         json.dump({"lead": lead, "company": COMPANY_CONTENT.get("company")}, f, indent=2)
     return path
 
-# ---------- SDR Agent ---------- #
+# ---------- Simple fraud-case SQLite DB utilities ---------- #
+def _connect_db() -> sqlite3.Connection:
+    conn = sqlite3.connect(FRAUD_DB_PATH, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    return conn
 
-# ---------- SDR Agent (patched to proactively collect leads) ---------- #
+def init_fraud_db():
+    conn = _connect_db()
+    cur = conn.cursor()
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS fraud_cases (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_name TEXT,
+        security_identifier TEXT,
+        masked_card TEXT,
+        transaction_amount TEXT,
+        merchant_name TEXT,
+        location TEXT,
+        timestamp TEXT,
+        security_question TEXT,
+        security_answer TEXT,
+        status TEXT,
+        outcome_note TEXT,
+        raw_json TEXT
+    )
+    """)
+    conn.commit()
+    conn.close()
 
-class SDRAgent(Agent):
+def seed_sample_fraud_cases():
+    conn = _connect_db()
+    cur = conn.cursor()
+    cur.execute("SELECT COUNT(1) as c FROM fraud_cases")
+    if cur.fetchone()["c"] > 0:
+        conn.close()
+        return
+    samples = [
+        {
+            "user_name": "John",
+            "security_identifier": "SID-1001",
+            "masked_card": "**** 4242",
+            "transaction_amount": "$129.99",
+            "merchant_name": "ABC Industry",
+            "location": "Bengaluru, India",
+            "timestamp": "2025-11-25 14:32:00",
+            "security_question": "What is the name of your first pet?",
+            "security_answer": "fluffy",
+            "status": "pending_review",
+        },
+        {
+            "user_name": "Alice",
+            "security_identifier": "SID-1002",
+            "masked_card": "**** 9876",
+            "transaction_amount": "$599.00",
+            "merchant_name": "GadgetWorld",
+            "location": "Mumbai, India",
+            "timestamp": "2025-11-25 09:15:00",
+            "security_question": "In which city were you born?",
+            "security_answer": "pune",
+            "status": "pending_review",
+        },
+        {
+            "user_name": "Bob",
+            "security_identifier": "SID-1003",
+            "masked_card": "**** 1111",
+            "transaction_amount": "$15.49",
+            "merchant_name": "FoodHub",
+            "location": "Delhi, India",
+            "timestamp": "2025-11-24 20:02:00",
+            "security_question": "What was your high school mascot?",
+            "security_answer": "tiger",
+            "status": "pending_review",
+        }
+    ]
+    for s in samples:
+        cur.execute("""
+            INSERT INTO fraud_cases
+            (user_name, security_identifier, masked_card, transaction_amount, merchant_name,
+             location, timestamp, security_question, security_answer, status, outcome_note, raw_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            s["user_name"], s["security_identifier"], s["masked_card"], s["transaction_amount"],
+            s["merchant_name"], s["location"], s["timestamp"], s["security_question"],
+            s["security_answer"], s["status"], "", json.dumps(s)
+        ))
+    conn.commit()
+    conn.close()
+
+def load_case_for_username(username: str) -> Optional[Dict[str, Any]]:
+    conn = _connect_db()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT * FROM fraud_cases
+        WHERE user_name = ? AND status = 'pending_review'
+        ORDER BY id ASC
+        LIMIT 1
+    """, (username,))
+    row = cur.fetchone()
+    conn.close()
+    if not row:
+        return None
+    return dict(row)
+
+def update_fraud_case(case_id: int, status: str, outcome_note: str):
+    conn = _connect_db()
+    cur = conn.cursor()
+    cur.execute("""
+        UPDATE fraud_cases
+        SET status = ?, outcome_note = ?, raw_json = ?
+        WHERE id = ?
+    """, (status, outcome_note, json.dumps({"last_updated": datetime.datetime.utcnow().isoformat()+"Z", "note": outcome_note}), case_id))
+    conn.commit()
+    conn.close()
+
+# initialize DB at import time (safe: idempotent)
+try:
+    init_fraud_db()
+    seed_sample_fraud_cases()
+except Exception as e:
+    logger.exception("Failed initializing fraud DB: %s", e)
+
+# ---------- Fraud Agent ---------- #
+
+class FraudAgent(Agent):
     """
-    Voice SDR agent for a single product/company.
-    Tools:
-      - answer_faq: answer product/company/pricing questions from loaded FAQ
-      - collect_lead: store lead fields as they are provided
-      - save_lead: persist lead to disk and return path
-
-    Behavior notes:
-      - Actively ask for lead details when the caller shows interest.
-      - Use the collect_lead tool to record each field as soon as the user provides it.
-      - When all required fields are captured OR the user says "I'm done"/"Thanks",
-        call save_lead to persist and return a final summary.
+    Fraud alert voice agent.
+    Tools exposed:
+      - fetch_case(username) -> returns fraud case JSON or a message if none
+      - verify_security(case_id, answer) -> returns True/False (and message)
+      - confirm_decision(case_id, decision) -> updates DB and returns summary message
+    Notes:
+      - Uses only fake data seeded in shared-data/fraud_cases.db
+      - NEVER ask for or store sensitive data like full card numbers, PINs, passwords, or OTPs.
     """
-
-    REQUIRED_LEAD_FIELDS = ["name", "company", "email"]  # minimal required to save
-    OPTIONAL_LEAD_FIELDS = ["role", "use_case", "team_size", "timeline"]
-    ALL_LEAD_FIELDS = REQUIRED_LEAD_FIELDS + OPTIONAL_LEAD_FIELDS
 
     def __init__(self, *, tts=None, extra_instructions: str = "", **kwargs):
-        company_name = _safe_company_field("name", "Unknown")
-        company_short = _safe_company_field("short_description", "")
-
-        # Clear, prescriptive instructions so the LLM will call the tools in a deterministic flow.
+        company_name = _safe_company_field("name", "Your Bank")
         base_instructions = f"""
-You are an SDR (sales development rep) voice agent for this company:
+You are a calm, professional fraud department representative for {company_name}.
+Your goal is to:
+ - Identify a pending suspicious transaction by asking for the user's username (first name).
+ - Verify identity using a single non-sensitive security question fetched from the fraud case.
+ - Read the suspicious transaction details (merchant, amount, masked card, approximate time and location).
+ - Ask the user whether they made the transaction ('yes' or 'no').
+ - If user confirms -> mark case as 'confirmed_safe' and summarize actions.
+ - If user denies -> mark case as 'confirmed_fraud' and explain mock actions (card blocked, dispute opened).
+ - If verification fails or user reply is unclear -> mark as 'verification_failed' and end call.
 
-Company: {company_name}
-Short description: {company_short}
-
-Goals:
-1) Understand the caller's needs by asking 'What brought you here today?' and a short follow-up.
-2) If the caller shows interest in evaluating the product or requests pricing/demo, OFFER to capture a few quick details to pass to Sales.
-3) Collect lead fields in this natural order: name, company, email, role, use_case, team_size, timeline.
-   - Ask one question at a time.
-   - After the user answers, call the tool `collect_lead(field, value)` with the field name and the user's value.
-   - If the user replies with multiple fields at once (e.g. "I'm Alice from Acme, email alice@acme.com"), call `collect_lead` for each parsed field.
-4) Once all REQUIRED fields (name OR email) are present, you may ask whether they'd like a demo or schedule a meeting.
-5) If the user says "that's all", "thanks", "I’m done", or you have all required fields, call the tool `save_lead()` and then read a short verbal summary:
-   - Example summary: "Thanks — I saved Alice (Acme), alice@acme.com. Use case: CRM evaluation for a 10-person team, timeline: soon. I'll pass this to sales."
-6) ALWAYS answer product/pricing/company questions from the loaded FAQ using the tool `answer_faq(question)` and never invent precise pricing or limits not present in FAQ. If FAQ lacks the detail, say you don't have that info and offer to connect to sales or schedule a demo.
-
-Tool usage rules (be explicit and consistent):
-- To answer product questions: call `answer_faq(question)` and return that tool output to the caller.
-- To store lead info: call `collect_lead(field, value)` where field is one of: {', '.join(self.ALL_LEAD_FIELDS)}.
-- To persist: call `save_lead()` when the user is done or required fields are collected.
-
-Dialog examples (use these styles, but keep it short and conversational):
-- Greeting: "Hi — I'm an SDR for {company_name}. What brought you here today?"
-- Offer to capture details: "If you'd like, I can quickly take a few details so our sales team can follow up — can I get your name?"
-- After saved: "Thanks — I've saved [name] ([company]), [email]. I'll pass this to our sales team."
-
+Never request full card numbers, PINs, OTPs, or passwords. Treat all database entries as fake/demo-only.
+When interacting with the caller, use short, reassuring sentences.
 {extra_instructions}
 """
-        super().__init__(instructions=base_instructions, tts=tts or TTS_SDR, **kwargs)
+        # Use only the tts passed in by the caller (do not reference a removed global)
+        super().__init__(instructions=base_instructions, tts=tts , **kwargs)
 
-    # ----------------- Tools ----------------- #
-
-    @function_tool()
-    async def answer_faq(self, context: RunContext, question: str) -> str:
-        """Return answer from our FAQ list, or a safe fallback if not found."""
-        faq = faq_lookup(question)
-        if faq:
-            return faq["a"]
-        short = _safe_company_field("short_description", "")
-        if short and any(w in question.lower() for w in ["what do you do", "what is", "about your product", "what does your product do"]):
-            return short
-        return "I don't have that information in my FAQ. I can book a demo or take your details and connect you with a sales rep."
+    # --------------------------- Tools --------------------------- #
 
     @function_tool()
-    async def collect_lead(self, context: RunContext, field: str, value: str) -> str:
+    async def fetch_case(self, context: RunContext, username: str) -> str:
         """
-        Save one lead field. field should be one of the keys in lead state.
+        Returns JSON string of the pending fraud case for username, or a message when none found.
         """
-        session = context.session
-        lead = _ensure_lead_state(session)
-        if field not in lead:
-            return f"Unknown field '{field}'. Valid fields: {', '.join(lead.keys())}"
-        lead[field] = value
-        return f"Noted: {field} set."
+        case = load_case_for_username(username.strip())
+        if not case:
+            return json.dumps({"found": False, "message": f"No pending suspicious transactions found for {username}."})
+        # Remove sensitive fields just in case (we only stored masked card)
+        sanitized = {
+            "found": True,
+            "id": case["id"],
+            "user_name": case["user_name"],
+            "security_identifier": case["security_identifier"],
+            "masked_card": case["masked_card"],
+            "transaction_amount": case["transaction_amount"],
+            "merchant_name": case["merchant_name"],
+            "location": case["location"],
+            "timestamp": case["timestamp"],
+            "security_question": case["security_question"],
+            "status": case["status"],
+        }
+        return json.dumps(sanitized)
 
     @function_tool()
-    async def save_lead(self, context: RunContext) -> str:
+    async def verify_security(self, context: RunContext, case_id: int, answer: str) -> str:
         """
-        Save the lead JSON to disk and return the file path.
+        Verify a non-sensitive security question answer for the given case_id.
+        Returns a JSON string with verification result and a simple message.
         """
-        session = context.session
-        lead = _ensure_lead_state(session)
-        # require at least name or email
-        if not (lead.get("email") or lead.get("name")):
-            return "I need at least a name or email to save the lead. Could you provide one?"
-        path = _save_lead_to_file(lead)
-        return f"Saved lead to {path}"
+        # load case by id
+        conn = _connect_db()
+        cur = conn.cursor()
+        cur.execute("SELECT security_answer FROM fraud_cases WHERE id = ?", (case_id,))
+        row = cur.fetchone()
+        conn.close()
+        if not row:
+            return json.dumps({"ok": False, "message": "Case not found."})
+        expected = (row["security_answer"] or "").strip().lower()
+        if expected == answer.strip().lower():
+            return json.dumps({"ok": True, "message": "Verification successful."})
+        else:
+            # update case status to verification_failed
+            update_fraud_case(case_id, "verification_failed", "Verification failed during automated call.")
+            return json.dumps({"ok": False, "message": "Verification failed."})
 
-    # ----------------- Conversation entry ----------------- #
+    @function_tool()
+    async def confirm_decision(self, context: RunContext, case_id: int, decision: str) -> str:
+        """
+        decision: expected 'yes' or 'no' (case-insensitive)
+        Updates DB status and returns a short outcome summary string.
+        """
+        dec = (decision or "").strip().lower()
+        if dec in ("yes", "y"):
+            update_fraud_case(case_id, "confirmed_safe", "Customer confirmed transaction as legitimate via automated call.")
+            return json.dumps({"status": "confirmed_safe", "message": "Marked transaction as legitimate. No further action."})
+        elif dec in ("no", "n"):
+            # mock actions (block card, open dispute)
+            update_fraud_case(case_id, "confirmed_fraud", "Customer denied transaction; card blocked and dispute initiated (mock).")
+            return json.dumps({"status": "confirmed_fraud", "message": "Marked transaction as fraudulent. Card blocked and dispute initiated (mock)."})
+        else:
+            update_fraud_case(case_id, "verification_failed", "Unclear answer provided during confirmation step.")
+            return json.dumps({"status": "verification_failed", "message": "Unclear response; ended call for safety."})
+
+    # --------------------------- Entry dialog --------------------------- #
+
     async def on_enter(self) -> None:
-        # Greet and ask first question to start the flow.
+        # Provide an explicit human-readable flow instruction so model will call the tools in order.
+        company_name = _safe_company_field("name", "Your Bank")
         await self.session.generate_reply(
             instructions=(
-                "Greet the caller warmly as the SDR for the company and ask: "
-                "'Hi — I'm an SDR for {company_name}. What brought you here today, and what are you working on?'\n\n"
-                "If the user expresses interest in evaluating the product or asks pricing/demo, say: "
-                "'Great — I can quickly capture a few details so our sales team can follow up. May I have your name?' "
-                "Then WAIT for user response. When the user answers with name, call the `collect_lead` tool."
+                "You are a fraud-detection representative for {company_name}. Start by greeting the caller and saying: "
+                "'Hello — this is the Fraud Department at {company_name}. For your safety, I will ask one quick verification question.' "
+                "Prompt the user: 'Please tell me your username (first name) so I can look up a suspicious transaction.'\n\n"
+                "When the user provides the username, call the tool `fetch_case(username)` to retrieve the pending case. "
+                "If no case found, read the tool message and politely end the call. "
+                "If a case is found, ask the security question from the case and WAIT for answer. "
+                "When the user answers, call `verify_security(case_id, answer)`. If verification fails, end the call. "
+                "If verification succeeds, read the transaction details (merchant, amount, masked card, approximate time and location), "
+                "then ask: 'Did you make this transaction? Please answer yes or no.' Wait for reply and then call `confirm_decision(case_id, decision)`; read the resulting message and end call."
             )
         )
-
 
 # ---------- Entrypoint and session setup ---------- #
 
 def prewarm(proc: JobProcess):
+    # Keep existing VAD prewarm behavior
     proc.userdata["vad"] = silero.VAD.load()
 
 async def entrypoint(ctx: JobContext):
+    import asyncio
     ctx.log_context_fields = {"room": ctx.room.name}
+
+    # make TTS inside event loop
+    tts = make_murf_tts()
+    logger.info("Created TTS instance: %s (close method present: %s)", type(tts), hasattr(tts, "close"))
+
     session = AgentSession(
         stt=deepgram.STT(model="nova-3"),
         llm=google.LLM(model="gemini-2.5-flash"),
-        tts=TTS_SDR,
+        tts=tts,
         turn_detection=MultilingualModel(),
         vad=ctx.proc.userdata["vad"],
         preemptive_generation=True,
     )
+    logger.info("AgentSession created, session.tts is not None: %s", getattr(session, "tts", None) is not None)
+
     session.userdata = {}
     usage_collector = metrics.UsageCollector()
+
     @session.on("metrics_collected")
     def _on_metrics_collected(ev: MetricsCollectedEvent):
         metrics.log_metrics(ev.metrics)
         usage_collector.collect(ev.metrics)
+
     async def log_usage():
         summary = usage_collector.get_summary()
         logger.info(f"Usage: {summary}")
+
     ctx.add_shutdown_callback(log_usage)
-    # start SDR
+
+    # Ensure TTS closed on shutdown
+    async def _close_tts():
+        try:
+            close_coro = getattr(tts, "close", None)
+            if close_coro:
+                if inspect.iscoroutinefunction(close_coro):
+                    await close_coro()
+                else:
+                    close_coro()
+                logger.info("Closed TTS instance cleanly on shutdown.")
+        except Exception as e:
+            logger.exception("Error closing Murf TTS: %s", e)
+
+    ctx.add_shutdown_callback(_close_tts)
+
+    # start Fraud agent (pass the same tts instance to agent)
     await session.start(
-        agent=SDRAgent(),
+        agent=FraudAgent(tts=tts),
         room=ctx.room,
         room_input_options=RoomInputOptions(
             noise_cancellation=noise_cancellation.BVC(),
         ),
     )
     await ctx.connect()
+
 
 if __name__ == "__main__":
     cli.run_app(WorkerOptions(entrypoint_fnc=entrypoint, prewarm_fnc=prewarm))
