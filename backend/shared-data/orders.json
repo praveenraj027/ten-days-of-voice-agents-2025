@@ -1,0 +1,42 @@
+[
+  {
+    "id": "620f3a98-2f8e-4c84-9d95-2abde9327e13",
+    "created_at": "2025-11-29T18:03:22.446866Z",
+    "status": "CONFIRMED",
+    "items": [
+      {
+        "product_id": "hoodie-001",
+        "name": "Classic Fleece Hoodie",
+        "quantity": 1,
+        "unit_price": 1200,
+        "currency": "INR",
+        "item_total": 1200
+      }
+    ],
+    "total": 1200,
+    "currency": "INR",
+    "buyer": {
+      "name": "Voice Customer"
+    }
+  },
+  {
+    "id": "63ab6655-b197-4593-9cf8-cd0e7a9693f0",
+    "created_at": "2025-11-29T18:04:24.640040Z",
+    "status": "CONFIRMED",
+    "items": [
+      {
+        "product_id": "hoodie-002",
+        "name": "Sport Tech Hoodie",
+        "quantity": 1,
+        "unit_price": 1800,
+        "currency": "INR",
+        "item_total": 1800
+      }
+    ],
+    "total": 1800,
+    "currency": "INR",
+    "buyer": {
+      "name": "Voice Customer"
+    }
+  }
+]
