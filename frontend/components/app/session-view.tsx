@@ -9,12 +9,11 @@ export default function SessionViewFixed({ playerName, appConfig }: { playerName
   const messages = useChatMessages();
 
   return (
-    <div className="flex h-full w-full justify-center items-center">
-      
+    <div className="flex h-full w-full justify-center items-center">    
       <div className="w-[50%] h-full p-6 text-white bg-black flex flex-col rounded-xl ">
         {/* HEADER */}
         <div className="text-2xl font-bold mb-4">
-          🎭 Improv Battle — Hello {playerName}!
+          🎭 Improv Battle — Hello, {playerName}!
         </div>
 
         {/* DEBUG MESSAGE COUNT */}
